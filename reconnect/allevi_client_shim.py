@@ -45,6 +45,7 @@ import json
 import tempfile
 import os
 import re
+import sys
 
 # ── Config ────────────────────────────────────────────────────────────
 # You should not need to edit any of this -- the printer is auto-discovered at
@@ -83,50 +84,121 @@ CLIENT_VERSION = "1.0.0-local-shim"
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _probe(addr, iface, timeout=3):
-    """Return the printer's serial number if an Allevi printer answers at
-    [addr%iface]:8000, else None."""
-    url = f"https://[{addr}%25{iface}]:{PRINTER_PORT}/state"
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _run(cmd, timeout=10):
+    """Run a command and return its stdout as text ('' if anything goes wrong)."""
     try:
-        r = subprocess.run(["curl", "-gk", "-s", "-m", str(timeout), url],
-                           capture_output=True, timeout=timeout + 3)
-        return json.loads(r.stdout.decode("utf-8", "replace"))["state"]["serialNumber"]
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return r.stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _probe(addr, zone, timeout=3):
+    """Return the printer's serial number if an Allevi printer answers at
+    [addr%zone]:8000, else None.
+
+    NOTE ON `zone`: an IPv6 link-local address is meaningless without saying
+    WHICH interface it is on. macOS/Linux name that interface ("en7", "eth0");
+    Windows numbers it ("12"). Getting this wrong is the single most common
+    reason link-local code that works on a Mac fails on Windows.
+    """
+    url = f"https://[{addr}%25{zone}]:{PRINTER_PORT}/state"
+    out = _run(["curl", "-gk", "-s", "-m", str(timeout), url], timeout=timeout + 3)
+    try:
+        return json.loads(out)["state"]["serialNumber"]
     except Exception:
         return None
 
 
-def _interfaces():
-    """Physical-ish interfaces worth scanning, newest first (USB-Ethernet
-    adapters tend to get the highest number, and that's usually the printer)."""
-    try:
-        out = subprocess.run(["ifconfig", "-l"], capture_output=True,
-                             timeout=5).stdout.decode()
-    except Exception:
-        return []
+def _zones():
+    """Interface identifiers to try, best candidates first.
+
+    macOS/Linux -> interface names   (en7, eth0)
+    Windows     -> interface indices ("12"), per the note in _probe.
+    """
+    if IS_WINDOWS:
+        # netsh columns: Idx  Met  MTU  State  Name
+        out = _run(["netsh", "interface", "ipv6", "show", "interfaces"])
+        zones = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].isdigit():
+                idx, name = parts[0], " ".join(parts[4:])
+                if idx == "1" or "loopback" in name.lower():
+                    continue
+                zones.append(idx)
+        return zones
+
+    if IS_LINUX:
+        out = _run(["ip", "-o", "link", "show"])
+        names = []
+        for line in out.splitlines():
+            m = re.match(r"\d+:\s+([^:@]+)", line)
+            if m and m.group(1).strip() != "lo":
+                names.append(m.group(1).strip())
+        return sorted(names, reverse=True)
+
+    out = _run(["ifconfig", "-l"])
     skip = ("lo", "gif", "stf", "awdl", "llw", "utun", "bridge", "ap", "anpi")
-    names = [i for i in out.split() if not i.startswith(skip)]
-    return sorted(names, reverse=True)
+    return sorted([i for i in out.split() if not i.startswith(skip)], reverse=True)
 
 
 def _neighbors():
-    """(addr, iface) pairs from the IPv6 neighbor table, Raspberry Pi MACs first."""
-    try:
-        out = subprocess.run(["ndp", "-an"], capture_output=True,
-                             timeout=8).stdout.decode("utf-8", "replace")
-    except Exception:
-        return []
+    """(addr, zone) pairs from the IPv6 neighbor table, Raspberry Pi MACs first."""
     found = []
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or not parts[0].startswith("fe80::"):
-            continue
-        if "%" not in parts[0]:
-            continue
-        addr, iface = parts[0].split("%", 1)
-        found.append((addr, iface, parts[1].lower().startswith(RPI_OUI)))
-    # Raspberry Pi MACs first -- most likely to be the printer
-    found.sort(key=lambda t: not t[2])
-    return [(a, i) for a, i, _ in found]
+
+    if IS_WINDOWS:
+        # Output is grouped in "Interface 12: Ethernet" sections.
+        out = _run(["netsh", "interface", "ipv6", "show", "neighbors"])
+        zone = None
+        for line in out.splitlines():
+            m = re.match(r"\s*Interface\s+(\d+):", line)
+            if m:
+                zone = m.group(1)
+                continue
+            parts = line.split()
+            if zone and parts and parts[0].lower().startswith("fe80::"):
+                mac = parts[1].lower().replace("-", ":") if len(parts) > 1 else ""
+                found.append((parts[0].split("%")[0], zone, mac.startswith(RPI_OUI)))
+
+    elif IS_LINUX:
+        # e.g. "fe80::... dev eth0 lladdr b8:27:eb:cd:65:56 STALE"
+        out = _run(["ip", "-6", "neigh", "show"])
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts or not parts[0].lower().startswith("fe80::"):
+                continue
+            zone = parts[parts.index("dev") + 1] if "dev" in parts else None
+            mac = parts[parts.index("lladdr") + 1].lower() if "lladdr" in parts else ""
+            if zone:
+                found.append((parts[0].split("%")[0], zone, mac.startswith(RPI_OUI)))
+
+    else:
+        out = _run(["ndp", "-an"])
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].startswith("fe80::") or "%" not in parts[0]:
+                continue
+            addr, zone = parts[0].split("%", 1)
+            found.append((addr, zone, parts[1].lower().startswith(RPI_OUI)))
+
+    found.sort(key=lambda t: not t[2])   # Raspberry Pi MACs first
+    return [(a, z) for a, z, _ in found]
+
+
+def _multicast_ping(zone):
+    """Ping the all-nodes multicast group so every device on the link answers
+    and shows up in the neighbor table."""
+    if IS_WINDOWS:
+        _run(["ping", "-6", "-n", "2", "-w", "1000", f"ff02::1%{zone}"], timeout=20)
+    elif IS_LINUX:
+        _run(["ping", "-6", "-c", "2", "-W", "1", "-I", zone, "ff02::1"], timeout=20)
+    else:
+        _run(["ping6", "-c", "2", "-I", zone, "ff02::1"], timeout=20)
 
 
 def find_printer(verbose=True):
@@ -134,7 +206,7 @@ def find_printer(verbose=True):
 
     Strategy, cheapest first:
       1. explicit override
-      2. last-known address, tried against each local interface
+      2. last-known address, tried against every local interface
       3. full scan: multicast-ping each interface, then probe the neighbor table
     """
     def say(m):
@@ -145,32 +217,73 @@ def find_printer(verbose=True):
         say(f"  using ALLEVI_PRINTER override: {PRINTER_OVERRIDE}")
         return f"https://[{PRINTER_OVERRIDE}]:{PRINTER_PORT}"
 
-    ifaces = _interfaces()
+    zones = _zones()
 
-    # 2. fast path -- the printer's address is stable; only the interface varies
-    for iface in ifaces:
-        sn = _probe(KNOWN_PRINTER_ADDR, iface, timeout=2)
+    # 2. fast path -- the printer's address is stable; only the zone varies
+    for zone in zones:
+        sn = _probe(KNOWN_PRINTER_ADDR, zone, timeout=2)
         if sn:
-            say(f"  found printer {sn} at {KNOWN_PRINTER_ADDR}%{iface}")
-            return f"https://[{KNOWN_PRINTER_ADDR}%25{iface}]:{PRINTER_PORT}"
+            say(f"  found printer {sn} at {KNOWN_PRINTER_ADDR}%{zone}")
+            return f"https://[{KNOWN_PRINTER_ADDR}%25{zone}]:{PRINTER_PORT}"
 
     # 3. full scan -- handles a printer whose address has changed
     say("  last-known address did not answer; scanning for the printer...")
-    for iface in ifaces:
-        subprocess.run(["ping6", "-c", "2", "-I", iface, "ff02::1"],
-                       capture_output=True, timeout=15)
+    for zone in zones:
+        _multicast_ping(zone)
     seen = set()
-    for addr, iface in _neighbors():
-        if (addr, iface) in seen:
+    for addr, zone in _neighbors():
+        if (addr, zone) in seen:
             continue
-        seen.add((addr, iface))
-        sn = _probe(addr, iface)
+        seen.add((addr, zone))
+        sn = _probe(addr, zone)
         if sn:
-            say(f"  found printer {sn} at {addr}%{iface}")
-            return f"https://[{addr}%25{iface}]:{PRINTER_PORT}"
+            say(f"  found printer {sn} at {addr}%{zone}")
+            return f"https://[{addr}%25{zone}]:{PRINTER_PORT}"
 
     say("  no Allevi printer found on any interface")
     return None
+
+
+def diagnose():
+    """Print everything discovery can see. Run with --diagnose and send the
+    output to whoever is helping you set this up."""
+    plat = "Windows" if IS_WINDOWS else ("Linux" if IS_LINUX else "macOS/other")
+    print(f"platform          : {plat} ({sys.platform}, os.name={os.name})")
+    print(f"python            : {sys.version.split()[0]}")
+    print(f"curl present      : {bool(_run(['curl', '--version']))}")
+    print(f"known address     : {KNOWN_PRINTER_ADDR}")
+    print(f"ALLEVI_PRINTER    : {PRINTER_OVERRIDE or '(not set)'}")
+
+    zones = _zones()
+    print(f"\ninterfaces/zones found ({len(zones)}): {zones or '(NONE -- this is the problem)'}")
+
+    print("\nprobing last-known address on each zone:")
+    for z in zones:
+        sn = _probe(KNOWN_PRINTER_ADDR, z, timeout=2)
+        print(f"  {KNOWN_PRINTER_ADDR}%{z:<12} -> {sn or 'no answer'}")
+
+    print("\nmulticast-pinging each zone to populate the neighbor table...")
+    for z in zones:
+        _multicast_ping(z)
+
+    nb = _neighbors()
+    print(f"\nIPv6 neighbors found ({len(nb)}):")
+    for addr, z in nb:
+        print(f"  {addr}%{z}")
+
+    print("\nprobing each neighbor:")
+    for addr, z in nb:
+        sn = _probe(addr, z)
+        print(f"  {addr}%{z:<12} -> {sn or 'no answer'}")
+
+    print("\nraw neighbor table:")
+    if IS_WINDOWS:
+        raw = _run(["netsh", "interface", "ipv6", "show", "neighbors"])
+    elif IS_LINUX:
+        raw = _run(["ip", "-6", "neigh", "show"])
+    else:
+        raw = _run(["ndp", "-an"])
+    print(raw[:3000] or "  (empty)")
 
 
 # Resolved lazily so the shim can start before the printer is plugged in, and
@@ -383,6 +496,10 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
+    if "--diagnose" in sys.argv:
+        diagnose()
+        raise SystemExit(0)
+
     print("Allevi Client Shim", flush=True)
     print(f"  listening on : http://127.0.0.1:{LOCAL_PORT}  (localhost only)", flush=True)
     print("  locating printer...", flush=True)
