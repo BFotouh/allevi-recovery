@@ -1,0 +1,16 @@
+# Ignore everything by default
+*
+
+# Let git look inside every folder so it can find what's allowed below
+!*/
+
+# What we're publishing right now: reconnect + top-level docs.
+# Everything else (local tooling, personal notes, etc.) stays invisible
+# to git until we explicitly add a line for it here.
+!reconnect/
+!reconnect/**
+
+!README.md
+!LICENSE
+!SAFETY.md
+!.gitignore
